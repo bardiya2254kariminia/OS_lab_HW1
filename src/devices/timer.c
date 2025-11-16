@@ -7,6 +7,7 @@
 #include "threads/interrupt.h"
 #include "threads/synch.h"
 #include "threads/thread.h"
+#include <kernel/list.h>
   
 /* See [8254] for hardware details of the 8254 timer chip. */
 
@@ -20,6 +21,8 @@
 /* Number of timer ticks since OS booted. */
 static int64_t ticks;
 
+struct list sleep_list;
+
 /* Number of loops per timer tick.
    Initialized by timer_calibrate(). */
 static unsigned loops_per_tick;
@@ -29,21 +32,6 @@ static bool too_many_loops (unsigned loops);
 static void busy_wait (int64_t loops);
 static void real_time_sleep (int64_t num, int32_t denom);
 static void real_time_delay (int64_t num, int32_t denom);
-
-
-// modified version to avoid busy waiting for the timer_sleep
-static struct list sleep_list;
-// function for the priority based list
-static bool
-wakeup_tick_less (const struct list_elem *a,
-                  const struct list_elem *b,
-                  void *aux UNUSED)
-{
-  const struct thread *ta = list_entry (a, struct thread, elem);
-  const struct thread *tb = list_entry (b, struct thread, elem);
-  return ta->wakeup_tick < tb->wakeup_tick;
-}
-
 
 /* Sets up the timer to interrupt TIMER_FREQ times per second,
    and registers the corresponding interrupt. */
@@ -76,7 +64,7 @@ timer_calibrate (void)
   /* Refine the next 8 bits of loops_per_tick. */
   high_bit = loops_per_tick;
   for (test_bit = high_bit >> 1; test_bit != high_bit >> 10; test_bit >>= 1)
-    if (!too_many_loops (loops_per_tick | test_bit))
+    if (!too_many_loops (high_bit | test_bit))
       loops_per_tick |= test_bit;
 
   printf ("%'"PRIu64" loops/s.\n", (uint64_t) loops_per_tick * TIMER_FREQ);
@@ -105,32 +93,25 @@ timer_elapsed (int64_t then)
 void
 timer_sleep (int64_t ticks) 
 {
-  if(ticks  <= 0)
-    return 0;
-  int64_t curr_tick = timer_ticks();
-  int64_t wakeup_time = curr_tick + ticks;
 
-  // Disable interrupts while we change thread state and list
-  enum intr_level old_level = intr_disable ();
-  struct thread *cur = thread_current ();
-  cur->wakeup_tick = wakeup_time;
-  //Insert into sleep_list in order (earliest wakeup first)
-  list_insert_ordered (&sleep_list, &cur->elem, wakeup_tick_less, NULL);
-  // Block the thread. This atomically removes it from ready queue. 
-  thread_block ();
-  // When the thread unblocks and resumes here, restore interrupt level. 
-  intr_set_level (old_level);
+	struct thread* curthread;
+	enum intr_level curlevel;
+
+  ASSERT (intr_get_level () == INTR_ON);
+
+  curlevel = intr_disable();
+
+  curthread = thread_current();
+
+  curthread->waketick = timer_ticks() + ticks;
+
+  list_insert_ordered (&sleep_list, &curthread->elem, cmp_waketick, NULL);
+
+  thread_block();
+
+  intr_set_level(curlevel);
+
 }
-// busy wait format
-// void
-// timer_sleep (int64_t ticks) 
-// {
-//   int64_t start = timer_ticks ();
-
-//   ASSERT (intr_get_level () == INTR_ON);
-//   while (timer_elapsed (start) < ticks) 
-//     thread_yield ();
-// }
 
 /* Sleeps for approximately MS milliseconds.  Interrupts must be
    turned on. */
@@ -206,31 +187,25 @@ timer_print_stats (void)
 static void
 timer_interrupt (struct intr_frame *args UNUSED)
 {
+	struct list_elem *head;
+	struct thread *hthread;
+
   ticks++;
   thread_tick ();
-  /* Wake up all threads whose wakeup_tick <= current tick.
-     Because sleep_list is ordered, we only need to inspect the front. */
-  while (!list_empty (&sleep_list))
-    {
-      struct list_elem *e = list_front (&sleep_list);
-      struct thread *t = list_entry (e, struct thread, elem);
-
-      if (t->wakeup_tick > ticks)
-        break;
-
-      list_pop_front (&sleep_list);
-      thread_unblock (t);
-    }
 
 
+	while(!list_empty(&sleep_list))
+	{
+		head = list_front(&sleep_list);
+	  hthread = list_entry (head, struct thread, elem);
 
+	  	if(hthread->waketick > ticks )
+	  		break;
+
+	  	list_remove (head);
+	  	thread_unblock(hthread);
+	}
 }
-// static void
-// timer_interrupt (struct intr_frame *args UNUSED)
-// {
-//   ticks++;
-//   thread_tick ();
-// }
 
 /* Returns true if LOOPS iterations waits for more than one timer
    tick, otherwise false. */
